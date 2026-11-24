@@ -1,118 +1,136 @@
 <template>
-  <div ref="container" class="clouds-container">
+  <div class="clouds-container">
     <img
-      v-for="i in 12"
+      v-for="(cfg, i) in LAYOUT"
       :key="i"
-      :ref="el => cloudRefs[i - 1] = el"
-      :src="cloudSrc(i)"
+      :ref="el => (cloudRefs[i] = el)"
+      :src="getCloudSrc(i + 1)"
+      :style="getCloudStyle(cfg)"
       class="cloud"
+      alt=""
+      draggable="false"
     />
   </div>
 </template>
 
 <script setup>
-import { onMounted, onBeforeUnmount, nextTick, ref } from 'vue'
+import { onMounted, onBeforeUnmount, ref } from 'vue'
 import gsap from 'gsap'
 
-const cloudRefs = []
-const container = ref(null)
+const cloudRefs = ref([])
+const tweens = []
 
-// bazowe pozycje (ułamki szer./wys.) odpowiadające podanym %
-const layout = [
-  { x: -0.005, y: -0.005, s: 1, zIndex: 1 },
-  { x: 0.14, y: 0, s: 0.6, zIndex: 2 },
-  { x: 0.20, y: 0.1, s: 1.05 },
-  { x: 0.20, y: -0.01, s: 0.90 },
-  { x: 0.29, y: 0.05, s: 0.95},
-  { x: 0.37, y: 0.09, s: 1.05, zIndex: 0 },
-  { x: 0.43, y: -0.01, s: 1.2 },
-  { x: 0.33, y: -0.05, s: 0.90 },
-  { x: 0.62, y: -0.05, s: 1.05 },
-  { x: 0.81, y: 0.30, s: 1.15 },
-  { x: 0.78, y: -0.02, s: 1.25 },
-  { x: 0.78, y: 0.20, s: 0.95, zIndex: 0 },
+// Spójny układ chmur + 3 płynne, ciągłe ścieżki ruchu (bez zatrzymań w rogach i bez skalowania)
+// 'right-up-back' -> płynna pętla: w prawo -> w górę -> powrót
+// 'left-right'    -> spokojny dryf prawo <-> lewo
+// 'left-up-right' -> płynna pętla: w lewo -> w górę -> w prawo -> powrót
+const LAYOUT = [
+  { x: -0.005, y: -0.005, s: 1.00, zIndex: 1, pattern: 'right-up-back', ax: 24, ay: 14, dur: 3.6 }, // cloud1 (żywsza)
+  { x: 0.14,   y: 0.00,   s: 0.60, zIndex: 2, pattern: 'left-right',    ax: 32, ay: 5,  dur: 2.8 }, // cloud2 (mała na przodzie - szybsza, dłuższy ruch)
+  { x: 0.20,   y: 0.10,   s: 1.05, zIndex: 1, pattern: 'left-up-right', ax: 30, ay: 16, dur: 3.3 }, // cloud3 (szybsza pętla)
+  { x: 0.20,   y: -0.01,  s: 0.90, zIndex: 1, pattern: 'left-right',    ax: 22, ay: 4,  dur: 4.8 }, // cloud4 (spokojniejsza baza)
+  { x: 0.29,   y: 0.05,   s: 0.95, zIndex: 1, pattern: 'right-up-back', ax: 28, ay: 15, dur: 3.1 }, // cloud5 (dynamiczniejsza)
+  { x: 0.37,   y: 0.09,   s: 1.05, zIndex: 0, pattern: 'left-up-right', ax: 36, ay: 18, dur: 3.7 }, // cloud6 (szeroki ruch w tle)
+  { x: 0.43,   y: -0.01,  s: 1.20, zIndex: 1, pattern: 'left-right',    ax: 25, ay: 5,  dur: 5.0 }, // cloud7 (duża centralna - spokojniejsza)
+  { x: 0.33,   y: -0.05,  s: 0.90, zIndex: 1, pattern: 'right-up-back', ax: 26, ay: 13, dur: 2.9 }, // cloud8 (pierwszy plan - szybsza)
+  { x: 0.62,   y: -0.05,  s: 1.05, zIndex: 1, pattern: 'left-up-right', ax: 28, ay: 14, dur: 3.5 }, // cloud9 (żywsza)
+  { x: 0.81,   y: 0.30,   s: 1.15, zIndex: 1, pattern: 'right-up-back', ax: 22, ay: 16, dur: 3.8 }, // cloud10 (prawa góra)
+  { x: 0.78,   y: -0.02,  s: 1.25, zIndex: 1, pattern: 'left-right',    ax: 24, ay: 4,  dur: 4.9 }, // cloud11 (duża prawa - spokojniejsza)
+  { x: 0.78,   y: 0.20,   s: 0.95, zIndex: 0, pattern: 'left-up-right', ax: 30, ay: 16, dur: 3.0 }, // cloud12 (szybsza w tle po prawej)
 ]
 
-const cloudSrc = (i) => new URL(`/src/assets/images/cloud${i}.png`, import.meta.url).href
-const clamp = (v, min, max) => Math.min(max, Math.max(min, v))
+const getCloudSrc = i => new URL(`../assets/images/cloud${i}.png`, import.meta.url).href
 
-function positionClouds() {
-  if (!container.value) return
-  const rect = container.value.getBoundingClientRect()
-
-  const baseFrac = 0.22
-  const minW = 160
-  const maxW = 480
-  const spreadX = 1.10
-  const spreadY = 1.08
-  const offsetX = -0.05
-  const offsetY = -0.02
-
-  layout.forEach((cfg, i) => {
-    const node = cloudRefs[i]
-    if (!node) return
-
-    const rawW = rect.width * baseFrac * cfg.s
-    const w = clamp(rawW, minW * cfg.s, maxW * cfg.s)
-
-    const left = (cfg.x * spreadX + offsetX) * rect.width
-    const bottomRaw = (cfg.y * spreadY + offsetY) * rect.height
-    const bottom = Math.max(bottomRaw, -0.25 * rect.height)
-
-    node.style.width = `${w}px`
-    node.style.height = 'auto'
-    node.style.left = `${left}px`
-    node.style.bottom = `${bottom}px`
-    node.style.zIndex = cfg.zIndex ?? 1
-  })
+function getCloudStyle(cfg) {
+  const left = (cfg.x * 1.1 - 0.05) * 100
+  const bottom = Math.max(cfg.y * 1.08 - 0.04, -0.25) * 100
+  return {
+    width: `clamp(${160 * cfg.s}px, ${22 * cfg.s}vw, ${480 * cfg.s}px)`,
+    left: `${left}%`,
+    bottom: `${bottom}%`,
+    zIndex: cfg.zIndex ?? 1,
+  }
 }
 
-let ro = null
+function startContinuousMotion(cloud, cfg, index) {
+  const { pattern, ax, ay, dur } = cfg
+  const phaseOffset = (index * 0.27) % 1
 
-onMounted(async () => {
-  await nextTick()
-  positionClouds()
+  // Przesunięcie fazowe między osią X a osią Y o 1/4 cyklu (0.5 trwania yoyo)
+  // sprawia, że gdy X zwalnia na końcu wychylenia, Y jest w pełnym ruchu - chmura NIGDY się nie zatrzymuje
+  if (pattern === 'right-up-back') {
+    const tweenX = gsap.fromTo(
+      cloud,
+      { x: 0 },
+      { x: ax, duration: dur, ease: 'sine.inOut', yoyo: true, repeat: -1, force3D: true }
+    )
+    const tweenY = gsap.fromTo(
+      cloud,
+      { y: 0 },
+      { y: -ay, duration: dur, ease: 'sine.inOut', yoyo: true, repeat: -1, force3D: true }
+    )
+    tweenX.totalProgress(phaseOffset)
+    tweenY.totalProgress((phaseOffset + 0.25) % 1)
+    tweens.push(tweenX, tweenY)
+  } else if (pattern === 'left-up-right') {
+    const tweenX = gsap.fromTo(
+      cloud,
+      { x: -ax },
+      { x: ax, duration: dur, ease: 'sine.inOut', yoyo: true, repeat: -1, force3D: true }
+    )
+    const tweenY = gsap.fromTo(
+      cloud,
+      { y: 0 },
+      { y: -ay, duration: dur, ease: 'sine.inOut', yoyo: true, repeat: -1, force3D: true }
+    )
+    tweenX.totalProgress(phaseOffset)
+    tweenY.totalProgress((phaseOffset + 0.25) % 1)
+    tweens.push(tweenX, tweenY)
+  } else {
+    // 'left-right' - spokojny ruch prawo-lewo z minimalnym wygładzeniem na nawrotach
+    const tweenX = gsap.fromTo(
+      cloud,
+      { x: -ax },
+      { x: ax, duration: dur, ease: 'sine.inOut', yoyo: true, repeat: -1, force3D: true }
+    )
+    const tweenY = gsap.fromTo(
+      cloud,
+      { y: -ay },
+      { y: ay, duration: dur * 0.85, ease: 'sine.inOut', yoyo: true, repeat: -1, force3D: true }
+    )
+    tweenX.totalProgress(phaseOffset)
+    tweenY.totalProgress((phaseOffset + 0.25) % 1)
+    tweens.push(tweenX, tweenY)
+  }
+}
 
-  cloudRefs.forEach((cloud, index) => {
+onMounted(() => {
+  // Ciągły ruch chmur to czysta dekoracja - pomijamy go przy prefers-reduced-motion
+  if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return
+
+  cloudRefs.value.forEach((cloud, index) => {
     if (!cloud) return
-    const dir = index % 2 === 0 ? 1 : -1
-    const amp = 20
-    const dur = 4 + Math.random() * 2.5
-    gsap.set(cloud, { x: 0, force3D: true })
-    gsap.to(cloud, {
-      x: dir * amp,
-      duration: dur,
-      yoyo: true,
-      repeat: -1,
-      ease: 'sine.inOut',
-      yoyoEase: true,
-      force3D: true,
-    })
+    startContinuousMotion(cloud, LAYOUT[index], index)
   })
-
-  ro = new ResizeObserver(() => positionClouds())
-  if (container.value) ro.observe(container.value)
 })
 
 onBeforeUnmount(() => {
-  if (ro && container.value) ro.unobserve(container.value)
+  tweens.forEach(t => t.kill())
+  tweens.length = 0
 })
 </script>
 
-<style>
+<style scoped>
 .clouds-container {
   position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
+  inset: 0;
   overflow: hidden;
   pointer-events: none;
 }
 
 .cloud {
   position: absolute;
-  bottom: 0;
+  height: auto;
   will-change: transform;
 }
 </style>
