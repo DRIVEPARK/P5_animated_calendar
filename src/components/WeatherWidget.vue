@@ -2,6 +2,7 @@
   <section class="weather" :class="`is-${status}`" aria-label="Weather forecast" aria-live="polite">
     <header class="weather-head">
       <span class="weather-place">{{ location.label }}</span>
+      <span class="details-hint" aria-hidden="true">DETAILS ›</span>
       <button
         class="loc-btn"
         :class="{ active: !location.isDefault, busy: locating }"
@@ -45,6 +46,15 @@
         <span class="f-temp">{{ formatTemp(day.max) }}</span>
       </li>
     </ul>
+
+    <!-- Cała karta otwiera modal ze szczegółami; przyciski lokalizacji i RETRY leżą nad nim -->
+    <button
+      class="open-details"
+      type="button"
+      aria-label="Open detailed weather"
+      title="Open detailed weather"
+      @click="emit('open')"
+    ></button>
   </section>
 </template>
 
@@ -54,6 +64,8 @@ import { DEFAULT_LOCATION, useWeather } from '../composables/useWeather'
 import { useToday } from '../composables/useToday'
 
 const UPCOMING_DAYS = 3
+
+const emit = defineEmits(['open'])
 
 const { today: todayDate } = useToday()
 const {
@@ -93,11 +105,18 @@ function toggleLocation() {
 
 <style scoped>
 .weather {
+  /* Spoczynkowa przezroczystość i kierunek wjazdu - nadpisywane w widoku mobilnym */
+  --rest-opacity: 0.85;
+  --enter-x: -120%;
+
   position: fixed;
-  top: 84px;
-  left: 18px;
+  /* Lewy dolny róg - prawy zajmuje odtwarzacz muzyki */
+  left: 22px;
+  bottom: 22px;
   /* Pod nakładką kalendarza (200), tak jak odtwarzacz */
   z-index: 190;
+  opacity: var(--rest-opacity);
+  transition: opacity 0.35s ease;
   width: 250px;
   display: flex;
   flex-direction: column;
@@ -111,16 +130,23 @@ function toggleLocation() {
   font-family: 'p5hatty', sans-serif;
   letter-spacing: 0.5px;
   user-select: none;
-  animation: weather-in 0.45s cubic-bezier(0.2, 1.4, 0.4, 1) 2.4s both;
+  /* backwards zamiast both: po animacji opacity wraca do zwykłych reguł, więc :hover działa */
+  animation: weather-in 0.45s cubic-bezier(0.2, 1.4, 0.4, 1) 2.4s backwards;
+}
+
+/* Po najechaniu (lub fokusie z klawiatury) widget płynnie traci przezroczystość */
+.weather:hover,
+.weather:focus-within {
+  opacity: 1;
 }
 
 @keyframes weather-in {
   from {
     opacity: 0;
-    transform: translateX(-120%) rotate(-8deg) skewX(-12deg);
+    transform: translateX(var(--enter-x)) rotate(-8deg) skewX(-12deg);
   }
   to {
-    opacity: 1;
+    opacity: var(--rest-opacity);
     transform: rotate(-2deg);
   }
 }
@@ -139,10 +165,50 @@ function toggleLocation() {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-family: 'p5menu', 'Persona5MenuFontPrototype-Regular', sans-serif;
+  font-family: 'p5hatty', sans-serif;
   font-size: 20px;
   text-transform: uppercase;
   text-shadow: 2px 2px 0 #1612ff;
+}
+
+/* Niewidzialny przycisk na całą kartę - otwiera modal pogodowy */
+.open-details {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  padding: 0;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+
+.open-details:focus-visible {
+  outline: 3px solid #4dffcf;
+  outline-offset: 4px;
+}
+
+.details-hint {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: 13px;
+  letter-spacing: 1px;
+  color: #4dffcf;
+  opacity: 0;
+  transform: translateX(-6px);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.weather:hover .details-hint,
+.weather:focus-within .details-hint {
+  opacity: 1;
+  transform: none;
+}
+
+/* Przyciski nad warstwą otwierającą modal */
+.loc-btn,
+.retry-btn {
+  position: relative;
+  z-index: 2;
 }
 
 .loc-btn {
@@ -351,9 +417,12 @@ function toggleLocation() {
 
 /* Telefon: kompaktowa wersja - sama dzisiejsza pogoda */
 @media (max-width: 600px) {
+  /* Widok mobilny bez zmian (do przebudowy) - lewy górny róg, bez przezroczystości */
   .weather {
+    --rest-opacity: 1;
     top: 76px;
     left: 10px;
+    bottom: auto;
     width: 168px;
     padding: 6px 8px 8px;
     gap: 6px;

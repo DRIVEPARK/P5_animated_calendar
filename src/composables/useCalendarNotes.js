@@ -3,6 +3,12 @@ import noteIcon from '../assets/images/note.png'
 import reminderIcon from '../assets/images/reminder.png'
 import todoIcon from '../assets/images/todo.png'
 
+// Wpisy kalendarza trzymane w localStorage pod kluczem dnia "RRRR-MM-DD".
+// Trzy typy o różnej strukturze:
+//   note     { type, title, text, timestamp }
+//   todo     { type, title, items: [{ id, text, done }], timestamp }
+//   reminder { type, text, time: "HH:MM", timestamp }
+
 const STORAGE_KEY = 'p5_calendar_notes'
 const FIRED_STORAGE_KEY = 'p5_calendar_fired_reminders'
 const ICON_BY_TYPE = {
@@ -13,8 +19,8 @@ const ICON_BY_TYPE = {
 
 const notes = ref({})
 const firedReminders = ref({})
-const toastVisible = ref(false)
-const toastMessage = ref('')
+// Kolejka przypomnień do pokazania - kilka może wypaść o tej samej godzinie
+const reminderQueue = ref([])
 
 let initialized = false
 let notificationsAllowed = false
@@ -26,14 +32,47 @@ export function formatKey(y, mZero, d) {
   return `${y}-${pad(mZero + 1)}-${pad(d)}`
 }
 
+export function makeId() {
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`
+}
+
+// Stare wpisy (jeden tekst + done) przechodzą na nowy format bez utraty danych
+function migrateEntry(entry) {
+  if (!entry || typeof entry !== 'object') return null
+  const base = { ...entry, timestamp: entry.timestamp || Date.now() }
+
+  if (base.type === 'todo') {
+    if (Array.isArray(base.items)) {
+      // Nowy format - tylko uzupełniamy brakujące pola, żeby uszkodzony wpis nie wywrócił widoku
+      const items = base.items
+        .filter(item => item && typeof item.text === 'string')
+        .map(item => ({ id: item.id || makeId(), text: item.text, done: !!item.done }))
+      return items.length ? { title: '', ...base, items } : null
+    }
+    // Stary format: jeden tekst + done -> lista z jednym punktem
+    const { text, done, time, ...rest } = base
+    return text ? { ...rest, title: '', items: [{ id: makeId(), text, done: !!done }] } : null
+  }
+  if (base.type === 'note') {
+    return { title: '', text: '', ...base }
+  }
+  if (base.type === 'reminder') {
+    return { text: '', time: '', ...base }
+  }
+  return null
+}
+
 function loadNotes() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     const parsed = raw ? JSON.parse(raw) : {}
-    Object.keys(parsed).forEach(key => {
-      if (!Array.isArray(parsed[key])) parsed[key] = []
+    const clean = {}
+    Object.entries(parsed).forEach(([key, entries]) => {
+      if (!Array.isArray(entries)) return
+      const migrated = entries.map(migrateEntry).filter(Boolean)
+      if (migrated.length) clean[key] = migrated
     })
-    notes.value = parsed
+    notes.value = clean
   } catch (err) {
     console.error('Failed to load notes', err)
     notes.value = {}
@@ -99,16 +138,26 @@ function triggerReminder(fireId, todayKey, entry) {
   )
   firedReminders.value = { ...kept, [fireId]: true }
   persistFiredReminders()
-  toastMessage.value = `Reminder ${entry.time || ''} - ${entry.text}`.trim()
-  toastVisible.value = true
 
+  reminderQueue.value = [
+    ...reminderQueue.value,
+    { id: fireId, text: entry.text, time: entry.time, dateKey: todayKey },
+  ]
+
+  // Powiadomienie systemowe - przydaje się, gdy karta z aplikacją jest w tle
   if (notificationsAllowed && 'Notification' in window) {
     try {
-      new Notification('Reminder', { body: entry.text })
+      new Notification(`Reminder ${entry.time}`, { body: entry.text, tag: fireId })
     } catch (err) {
       console.error('Notification error', err)
     }
   }
+}
+
+function parseTime(time, base) {
+  const [h, m] = String(time || '').split(':').map(Number)
+  if (!Number.isInteger(h) || !Number.isInteger(m)) return null
+  return new Date(base.getFullYear(), base.getMonth(), base.getDate(), h, m, 0, 0)
 }
 
 function checkReminders() {
@@ -118,17 +167,59 @@ function checkReminders() {
   if (!Array.isArray(entries)) return
 
   entries.forEach(entry => {
-    if (entry.type !== 'reminder' || !entry.time) return
-    const [h, m] = entry.time.split(':').map(Number)
-    if (Number.isNaN(h) || Number.isNaN(m)) return
+    if (entry.type !== 'reminder') return
+    const remindAt = parseTime(entry.time, now)
+    if (!remindAt) return
 
-    const remindAt = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0, 0)
     // Bez indeksu - usunięcie wcześniejszego wpisu nie może zmienić identyfikatora
     const fireId = `${todayKey}:${entry.timestamp}`
     if (now >= remindAt && !firedReminders.value[fireId]) {
       triggerReminder(fireId, todayKey, entry)
     }
   })
+}
+
+// Status przypomnienia do pokazania na liście wpisów
+export function reminderStatus(dateKey, entry, now = new Date()) {
+  const [y, m, d] = dateKey.split('-').map(Number)
+  const remindAt = parseTime(entry.time, new Date(y, m - 1, d))
+  if (!remindAt) return 'no-time'
+  return now >= remindAt ? 'done' : 'upcoming'
+}
+
+// Krótki opis wpisu na pasku w komórce kalendarza
+export function entrySummary(entry) {
+  if (entry.type === 'todo') {
+    const done = entry.items.filter(i => i.done).length
+    const label = entry.title || entry.items[0]?.text || 'To-do'
+    return `${label} ${done}/${entry.items.length}`
+  }
+  if (entry.type === 'note') return entry.title || entry.text
+  return entry.text
+}
+
+function buildEntry(type, payload) {
+  const timestamp = Date.now()
+  if (type === 'todo') {
+    const items = (payload.items || [])
+      .map(text => String(text).trim())
+      .filter(Boolean)
+      .map(text => ({ id: makeId(), text, done: false }))
+    if (!items.length) return null
+    return { type, title: (payload.title || '').trim(), items, timestamp }
+  }
+  if (type === 'note') {
+    const title = (payload.title || '').trim()
+    const text = (payload.text || '').trim()
+    if (!title && !text) return null
+    return { type, title, text, timestamp }
+  }
+  if (type === 'reminder') {
+    const text = (payload.text || '').trim()
+    if (!text || !payload.time) return null
+    return { type, text, time: payload.time, timestamp }
+  }
+  return null
 }
 
 export function useCalendarNotes() {
@@ -149,43 +240,49 @@ export function useCalendarNotes() {
     return map
   })
 
-  function addEntry(key, { type, text, time = '' }) {
-    const existing = Array.isArray(notes.value[key]) ? notes.value[key] : []
-    const entry = {
-      type,
-      text,
-      time,
-      done: false,
-      timestamp: Date.now(),
-    }
-    notes.value = { ...notes.value, [key]: [...existing, entry] }
-    persistNotes()
-    if (type === 'reminder') requestNotificationPermission()
-    checkReminders()
-  }
+  const activeReminder = computed(() => reminderQueue.value[0] || null)
 
-  function toggleTodoByKey(key, index) {
+  function updateEntries(key, updater) {
     const entries = Array.isArray(notes.value[key]) ? [...notes.value[key]] : []
-    const item = entries[index]
-    if (!item || item.type !== 'todo') return
-    entries[index] = { ...item, done: !item.done }
-    notes.value = { ...notes.value, [key]: entries }
-    persistNotes()
-  }
-
-  function removeEntryByKey(key, index) {
-    const entries = Array.isArray(notes.value[key]) ? [...notes.value[key]] : []
-    if (index < 0 || index >= entries.length) return
-    entries.splice(index, 1)
-
-    const updated = { ...notes.value, [key]: entries }
-    if (!entries.length) delete updated[key]
+    const next = updater(entries)
+    const updated = { ...notes.value, [key]: next }
+    if (!next.length) delete updated[key]
     notes.value = updated
     persistNotes()
   }
 
-  function closeToast() {
-    toastVisible.value = false
+  function addEntry(key, payload) {
+    const entry = buildEntry(payload.type, payload)
+    if (!entry) return false
+    updateEntries(key, entries => [...entries, entry])
+    if (entry.type === 'reminder') {
+      requestNotificationPermission()
+      checkReminders()
+    }
+    return true
+  }
+
+  function toggleTodoItem(key, entryIndex, itemId) {
+    updateEntries(key, entries => {
+      const entry = entries[entryIndex]
+      if (!entry || entry.type !== 'todo') return entries
+      entries[entryIndex] = {
+        ...entry,
+        items: entry.items.map(item => (item.id === itemId ? { ...item, done: !item.done } : item)),
+      }
+      return entries
+    })
+  }
+
+  function removeEntryByKey(key, index) {
+    updateEntries(key, entries => {
+      if (index >= 0 && index < entries.length) entries.splice(index, 1)
+      return entries
+    })
+  }
+
+  function dismissReminder(id) {
+    reminderQueue.value = reminderQueue.value.filter(r => r.id !== id)
   }
 
   onMounted(() => {
@@ -208,11 +305,10 @@ export function useCalendarNotes() {
   return {
     notes,
     dayIcons,
-    toastVisible,
-    toastMessage,
+    activeReminder,
     addEntry,
-    toggleTodoByKey,
+    toggleTodoItem,
     removeEntryByKey,
-    closeToast,
+    dismissReminder,
   }
 }

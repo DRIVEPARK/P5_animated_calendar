@@ -63,7 +63,7 @@ onMounted(async () => {
   text-align: center;
   width: 100%;
   height: 100%;
-  font-family: 'p5hatty', 'Persona5MenuFontPrototype-Regular', sans-serif;
+  font-family: 'p5hatty', sans-serif;
 }
 
 .hat {

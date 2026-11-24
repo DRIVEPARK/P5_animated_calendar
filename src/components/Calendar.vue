@@ -23,7 +23,7 @@
     </button>
 
     <div class="grid-overlay" @click="dismissSelection">
-      <div class="calendar-shell" @click.stop="dismissSelection">
+      <div ref="shellEl" class="calendar-shell" @click.stop="dismissSelection">
         <!-- Górny baner miesiąca w stylu Persona 5 -->
         <header class="calendar-header">
           <div class="month-banner">
@@ -73,7 +73,7 @@
         </div>
 
         <!-- Siatka 42 dni (High-Contrast Black & White + P5 accents) -->
-        <div class="dates-grid">
+        <div ref="gridEl" class="dates-grid">
           <div
             v-for="(day, idx) in grid"
             :key="idx"
@@ -107,16 +107,7 @@
 
             <div class="cell-top">
               <span class="day-number">{{ day.day }}</span>
-              <div class="cell-badges">
-                <span
-                  v-if="day.type === 'current' && cellWeather(day)"
-                  class="weather-badge"
-                  :title="weatherTitle(cellWeather(day))"
-                >
-                  <img :src="cellWeather(day).icon" alt="" draggable="false" />
-                </span>
-                <span v-if="day.isToday" class="today-stamp">TODAY</span>
-              </div>
+              <span v-if="day.isToday" class="today-stamp">TODAY</span>
             </div>
 
             <!-- Pieczątki / wpisy dnia w stylu Persona 5 -->
@@ -139,10 +130,13 @@
               </div>
 
               <div class="p5-note-strip" :class="getDayEntries(day.day)[0].type">
-                <span v-if="getDayEntries(day.day)[0].time" class="strip-time">
+                <span
+                  v-if="getDayEntries(day.day)[0].type === 'reminder'"
+                  class="strip-time"
+                >
                   {{ getDayEntries(day.day)[0].time }}
                 </span>
-                <span class="strip-text">{{ getDayEntries(day.day)[0].text }}</span>
+                <span class="strip-text">{{ entrySummary(getDayEntries(day.day)[0]) }}</span>
               </div>
             </div>
           </div>
@@ -188,24 +182,24 @@
       :modal-type="modalType"
       :detail-open="detailOpen"
       :selected-label="selectedLabel"
+      :date-key="selectedDay ? dayKey(selectedDay.day) : ''"
       :entries="detailEntries"
       @close-modal="modalOpen = false"
       @save-entry="saveEntry"
       @close-detail="detailOpen = false"
-      @toggle-todo="toggleTodo"
+      @toggle-todo-item="toggleTodoItemAt"
       @remove-entry="removeEntry"
     />
   </div>
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import gsap from 'gsap'
 import CalendarModals from './CalendarModals.vue'
 import { useAudio } from '../composables/useAudio'
-import { formatKey, useCalendarNotes } from '../composables/useCalendarNotes'
+import { entrySummary, formatKey, useCalendarNotes } from '../composables/useCalendarNotes'
 import { useToday } from '../composables/useToday'
-import { useWeather } from '../composables/useWeather'
 import knifeSrc from '../assets/images/knife.png'
 import closeIcon from '../assets/images/cancel.png'
 import prevIcon from '../assets/images/previous.png'
@@ -244,15 +238,16 @@ const monthLabel = computed(() =>
 )
 
 const { playKnifeSound } = useAudio()
-const { weatherFor } = useWeather()
 const {
   notes,
   dayIcons,
   addEntry,
-  toggleTodoByKey,
+  toggleTodoItem,
   removeEntryByKey,
 } = useCalendarNotes()
 
+const shellEl = ref(null)
+const gridEl = ref(null)
 const cellRefs = ref({})
 const knifeEl = ref(null)
 const activeKnifeIdx = ref(null)
@@ -271,22 +266,10 @@ function getDayEntries(dayNumber) {
   return notes.value[dayKey(dayNumber)] || []
 }
 
-function cellWeather(day) {
-  return weatherFor(viewYear.value, viewMonth.value, day.day)
-}
-
-function weatherTitle(weather) {
-  const temp = t => (Number.isFinite(t) ? `${t}°` : '--')
-  return `${weather.label}, ${temp(weather.max)} / ${temp(weather.min)}`
-}
-
 function cellAriaLabel(day) {
   const count = getDayEntries(day.day).length
-  const weather = cellWeather(day)
-  let label = `${monthLabel.value} ${day.day}, ${viewYear.value}${day.isToday ? ', today' : ''}`
-  if (weather) label += `, ${weatherTitle(weather)}`
-  if (count) label += `, ${count} ${count === 1 ? 'entry' : 'entries'}`
-  return label
+  const base = `${monthLabel.value} ${day.day}, ${viewYear.value}${day.isToday ? ', today' : ''}`
+  return count ? `${base}, ${count} ${count === 1 ? 'entry' : 'entries'}` : base
 }
 
 function setCellRef(idx, el) {
@@ -368,9 +351,9 @@ function openDetail(day) {
   detailOpen.value = true
 }
 
-function toggleTodo(index) {
+function toggleTodoItemAt(entryIndex, itemId) {
   if (!selectedDay.value) return
-  toggleTodoByKey(dayKey(selectedDay.value.day), index)
+  toggleTodoItem(dayKey(selectedDay.value.day), entryIndex, itemId)
 }
 
 function removeEntry(index) {
@@ -430,7 +413,7 @@ async function onCellClick(idx, day) {
       gsap.fromTo(
         cell,
         { x: -3, y: 3 },
-        { x: 0, y: 0, duration: 0.16, ease: 'power2.out' }
+        { x: 0, y: 0, duration: 0.16, ease: 'power2.out', clearProps: 'transform' }
       )
 
       selectedDay.value = day
@@ -460,8 +443,59 @@ function onKeyDown(e) {
   }
 }
 
+// Wejście kalendarza i przejścia między miesiącami - komórki "wpadają" kaskadowo jak w menu P5
+const prefersReducedMotion = () =>
+  window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
+
+function animateCells(direction = 0) {
+  const cells = gridEl.value?.children
+  if (!cells?.length || prefersReducedMotion()) return
+
+  gsap.killTweensOf(cells)
+  gsap.fromTo(
+    cells,
+    {
+      opacity: 0,
+      x: direction * 46,
+      y: direction ? 0 : -22,
+      rotate: direction ? direction * 5 : -6,
+      scale: 0.9,
+    },
+    {
+      opacity: 1,
+      x: 0,
+      y: 0,
+      rotate: 0,
+      scale: 1,
+      duration: 0.3,
+      ease: 'back.out(1.7)',
+      stagger: { each: 0.011, from: direction < 0 ? 'end' : 'start' },
+      // Po animacji wracają transformacje z CSS (lekkie przechylenia, hover)
+      clearProps: 'opacity,transform',
+    }
+  )
+}
+
+watch([viewYear, viewMonth], async ([y, m], [prevY, prevM]) => {
+  const direction = y * 12 + m > prevY * 12 + prevM ? 1 : -1
+  await nextTick()
+  animateCells(direction)
+})
+
 onMounted(() => {
   window.addEventListener('keydown', onKeyDown)
+
+  if (!prefersReducedMotion() && shellEl.value) {
+    gsap.from(shellEl.value, {
+      opacity: 0,
+      x: -90,
+      skewX: -10,
+      duration: 0.34,
+      ease: 'power3.out',
+      clearProps: 'opacity,transform',
+    })
+  }
+  animateCells(0)
 })
 
 onUnmounted(() => {
@@ -476,7 +510,7 @@ onUnmounted(() => {
   height: 100vh;
   overflow: hidden;
   user-select: none;
-  font-family: 'p5hatty', 'Persona5MenuFontPrototype-Regular', sans-serif;
+  font-family: 'p5hatty', sans-serif;
 }
 
 /* Przycisk zamknięcia (X) */
@@ -564,11 +598,15 @@ onUnmounted(() => {
 }
 
 .calendar-shell {
+  position: relative;
   width: min(1300px, 82vw);
   height: 88vh;
   display: flex;
   flex-direction: column;
-  background: #000;
+  /* Raster z niebieskich kropek prześwituje w szczelinach między komórkami */
+  background:
+    radial-gradient(circle, rgba(22, 18, 255, 0.32) 1.3px, transparent 1.8px) 0 0 / 9px 9px,
+    #000;
   border: 4px solid #fff;
   box-shadow:
     12px 14px 0 #1612ff,
@@ -577,6 +615,22 @@ onUnmounted(() => {
   box-sizing: border-box;
   gap: 10px;
   transform: rotate(-0.4deg);
+}
+
+/* Czerwona "taśma" przyklejona na górnej krawędzi ramy */
+.calendar-shell::before {
+  content: '';
+  position: absolute;
+  top: -16px;
+  right: 9%;
+  width: clamp(110px, 12vw, 180px);
+  height: 26px;
+  background: #ff1e38;
+  border: 3px solid #000;
+  box-shadow: 4px 4px 0 #fff;
+  transform: skewX(-22deg) rotate(3deg);
+  pointer-events: none;
+  z-index: 2;
 }
 
 /* Górny baner miesiąca w stylu HUD Persona 5 */
@@ -635,7 +689,7 @@ onUnmounted(() => {
 }
 
 .month-name {
-  font-family: 'p5menu', 'Persona5MenuFontPrototype-Regular', sans-serif;
+  font-family: 'p5menu', sans-serif;
   font-size: clamp(28px, 3vw, 44px);
   color: #fff;
   text-transform: uppercase;
@@ -717,7 +771,8 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  background: #000;
+  /* Delikatny połysk z lewego górnego rogu zamiast płaskiej czerni */
+  background: linear-gradient(155deg, #1c1c1c 0%, #070707 42%, #000 100%);
   border: 2px solid #fff;
   color: #fff;
   padding: 6px 8px;
@@ -734,6 +789,33 @@ onUnmounted(() => {
 
 .cell:nth-child(even) .day-number {
   transform: rotate(2.5deg);
+}
+
+/* Lekko nieregularne ułożenie kafelków - komiksowy, "ręcznie przyklejony" charakter */
+.cell:nth-child(4n + 1) {
+  transform: rotate(-0.6deg);
+}
+
+.cell:nth-child(4n + 3) {
+  transform: rotate(0.5deg);
+}
+
+/* Ścięty narożnik w prawym dolnym rogu (lustrzane odbicie znaczników weekendu) */
+.cell.hoverable::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 22px;
+  height: 22px;
+  background: linear-gradient(135deg, transparent 50%, rgba(255, 255, 255, 0.16) 50%);
+  pointer-events: none;
+  transition: background 0.14s ease;
+}
+
+.cell.hoverable:hover::after,
+.cell.selected::after {
+  background: linear-gradient(135deg, transparent 50%, #fff 50%);
 }
 
 .cell.hoverable {
@@ -763,7 +845,9 @@ onUnmounted(() => {
 
 .cell.saturday {
   border-color: #4da3ff;
-  background: linear-gradient(135deg, #006eff 0px, #006eff 14px, #000 14px);
+  background:
+    linear-gradient(135deg, #006eff 0 14px, transparent 14px),
+    linear-gradient(155deg, #0b1630 0%, #03060f 42%, #000 100%);
 }
 
 .cell.saturday .day-number {
@@ -772,7 +856,9 @@ onUnmounted(() => {
 
 .cell.sunday {
   border-color: #ff1e38;
-  background: linear-gradient(135deg, #ff1e38 0px, #ff1e38 14px, #000 14px);
+  background:
+    linear-gradient(135deg, #ff1e38 0 14px, transparent 14px),
+    linear-gradient(155deg, #2a0a10 0%, #0c0204 42%, #000 100%);
 }
 
 .cell.sunday .day-number {
@@ -789,26 +875,33 @@ onUnmounted(() => {
   color: #fff;
 }
 
-/* DZISIAJ - Odwrócony kontrast (Biały kafelek z czarnym tekstem i niebieskim cieniem) */
+/* DZISIAJ - odwrócony kontrast: biały kafelek, czerwony cień i akcent jak w HUD-zie P5 */
 .cell.today {
   background: #fff;
   border: 3px solid #000;
-  box-shadow: 6px 6px 0 #1612ff, 0 0 0 2px #fff;
+  box-shadow: 6px 6px 0 #ff1e38, 0 0 0 2px #fff;
+  transform: rotate(-1.2deg);
+  z-index: 5;
 }
 
 .cell.today .day-number {
   color: #000;
-  text-shadow: 2px 2px 0 #4dffcf;
+  text-shadow: 3px 3px 0 #ff1e38;
+}
+
+.cell.today::after {
+  background: linear-gradient(135deg, transparent 50%, #ff1e38 50%);
 }
 
 .cell.today.hoverable:hover {
   background: #ffd166;
-  box-shadow: 7px 7px 0 #1612ff;
+  box-shadow: 7px 7px 0 #ff1e38;
 }
 
+/* Dni z sąsiednich miesięcy - kreskowane tło zamiast pustych, ciemnych pól */
 .cell.muted {
-  background: #000;
-  border: 1px solid #2a2a2a;
+  background: repeating-linear-gradient(135deg, #111 0 5px, #000 5px 11px);
+  border: 1px solid #262626;
   pointer-events: none;
 }
 
@@ -828,50 +921,26 @@ onUnmounted(() => {
 
 .day-number {
   display: inline-block;
-  font-family: 'p5hatty', 'Persona5MenuFontPrototype-Regular', sans-serif;
-  font-size: clamp(28px, 2.6vw, 40px);
+  font-family: 'p5hatty', sans-serif;
+  font-size: clamp(30px, 2.8vw, 44px);
   font-weight: 900;
   line-height: 0.95;
   letter-spacing: 1px;
   color: #fff;
+  /* Niebieski offset zamiast czarnego cienia, który na czarnym tle był niewidoczny */
+  text-shadow: 3px 3px 0 #1612ff;
+}
+
+.cell.hoverable:hover .day-number,
+.cell.selected .day-number {
   text-shadow: 3px 3px 0 #000;
 }
 
-.cell-badges {
-  display: flex;
-  align-items: flex-start;
-  gap: 5px;
-  min-width: 0;
-}
-
-/* Prognoza z useWeather - biała plakietka, bo ikony mają czarne kontury */
-.weather-badge {
-  display: grid;
-  place-items: center;
-  width: clamp(26px, 2.4vw, 36px);
-  height: clamp(20px, 1.9vw, 28px);
-  background: #fff;
-  border: 2px solid #000;
-  box-shadow: 2px 2px 0 #1612ff;
-  transform: skewX(-8deg) rotate(3deg);
-  pointer-events: auto;
-}
-
-.weather-badge img {
-  width: 86%;
-  height: 86%;
-  object-fit: contain;
-}
-
-.cell.muted .weather-badge {
-  display: none;
-}
-
 .today-stamp {
-  background: #000;
-  color: #ffd166;
+  background: #ff1e38;
+  color: #fff;
   border: 2px solid #000;
-  box-shadow: 3px 3px 0 #1612ff;
+  box-shadow: 3px 3px 0 #000;
   font-family: 'p5hatty', sans-serif;
   font-size: clamp(13px, 1.1vw, 17px);
   font-weight: 900;
@@ -992,7 +1061,7 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  font-family: 'p5hatty', 'Persona5MenuFontPrototype-Regular', sans-serif;
+  font-family: 'p5hatty', sans-serif;
 }
 
 .popover-header {
@@ -1172,13 +1241,6 @@ onUnmounted(() => {
   .stamp-icon {
     width: 14px;
     height: 14px;
-  }
-
-  .weather-badge {
-    width: 18px;
-    height: 14px;
-    border-width: 1px;
-    box-shadow: none;
   }
 
   .knife {

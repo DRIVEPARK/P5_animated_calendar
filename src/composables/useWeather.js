@@ -1,11 +1,15 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { formatKey } from './useCalendarNotes'
 
-// Prognoza dzienna z Open-Meteo (bez klucza API). Jeden wspólny stan dla całej aplikacji:
-// widget pogody i siatka kalendarza korzystają z tych samych danych i jednego zapytania.
+// Pogoda z Open-Meteo (bez klucza API). Jeden wspólny stan dla całej aplikacji:
+// widget i modal pogodowy korzystają z tych samych danych i jednego zapytania.
+// Zapytanie zwraca: warunki bieżące, prognozę godzinową na 24 h i dzienną (-7 / +16 dni).
 
 const API_URL = 'https://api.open-meteo.com/v1/forecast'
-const CACHE_KEY = 'p5_calendar_weather_cache'
+// v2 - cache zawiera też dane bieżące i godzinowe; stary format jest pomijany
+const CACHE_KEY = 'p5_calendar_weather_cache_v2'
+const LEGACY_CACHE_KEY = 'p5_calendar_weather_cache'
+const HOURLY_HOURS = 24
 const LOCATION_KEY = 'p5_calendar_weather_location'
 const CACHE_TTL_MS = 30 * 60 * 1000
 const REFRESH_INTERVAL_MS = 30 * 60 * 1000
@@ -56,8 +60,18 @@ export function conditionFromCode(code) {
   return match ? match[1] : 'cloudy'
 }
 
+export const COMPASS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
+
+export function compassFromDegrees(deg) {
+  if (!Number.isFinite(deg)) return '--'
+  return COMPASS[Math.round(deg / 45) % 8]
+}
+
 const location = ref(loadLocation())
 const daily = ref({})
+const current = ref(null)
+const hourly = ref([])
+const fetchedAt = ref(null)
 const status = ref('idle') // idle | loading | ready | error
 const errorMessage = ref('')
 const locating = ref(false)
@@ -95,29 +109,74 @@ function cacheId(loc) {
   return `${loc.latitude.toFixed(3)},${loc.longitude.toFixed(3)}`
 }
 
+const num = v => (Number.isFinite(v) ? v : null)
+const rounded = v => (Number.isFinite(v) ? Math.round(v) : null)
+// "2026-11-24T07:11" -> "07:11"
+const clock = iso => (typeof iso === 'string' && iso.includes('T') ? iso.split('T')[1].slice(0, 5) : null)
+
+function describe(code) {
+  const condition = conditionFromCode(Number(code))
+  return { code: Number(code), condition, label: CONDITIONS[condition], icon: ICONS[condition] }
+}
+
 function parseDaily(data) {
   const d = data?.daily
   if (!d || !Array.isArray(d.time)) throw new Error('No daily data')
 
-  const codes = d.weather_code || []
-  const maxes = d.temperature_2m_max || []
-  const mins = d.temperature_2m_min || []
   const result = {}
-
   d.time.forEach((dateKey, i) => {
-    const code = Number(codes[i])
-    const condition = conditionFromCode(code)
     result[dateKey] = {
       date: dateKey,
-      code,
-      condition,
-      label: CONDITIONS[condition],
-      icon: ICONS[condition],
-      max: Number.isFinite(maxes[i]) ? Math.round(maxes[i]) : null,
-      min: Number.isFinite(mins[i]) ? Math.round(mins[i]) : null,
+      ...describe(d.weather_code?.[i]),
+      max: rounded(d.temperature_2m_max?.[i]),
+      min: rounded(d.temperature_2m_min?.[i]),
+      sunrise: clock(d.sunrise?.[i]),
+      sunset: clock(d.sunset?.[i]),
+      precipProbability: rounded(d.precipitation_probability_max?.[i]),
+      precipSum: num(d.precipitation_sum?.[i]),
+      windMax: rounded(d.wind_speed_10m_max?.[i]),
+      uvMax: num(d.uv_index_max?.[i]),
     }
   })
   return result
+}
+
+function parseCurrent(data) {
+  const c = data?.current
+  if (!c) return null
+  return {
+    time: c.time,
+    ...describe(c.weather_code),
+    temperature: rounded(c.temperature_2m),
+    feelsLike: rounded(c.apparent_temperature),
+    humidity: rounded(c.relative_humidity_2m),
+    windSpeed: rounded(c.wind_speed_10m),
+    windGusts: rounded(c.wind_gusts_10m),
+    windDirection: num(c.wind_direction_10m),
+    pressure: rounded(c.pressure_msl),
+    cloudCover: rounded(c.cloud_cover),
+    precipitation: num(c.precipitation),
+    isDay: c.is_day === 1,
+  }
+}
+
+function parseHourly(data) {
+  const h = data?.hourly
+  if (!h || !Array.isArray(h.time)) return []
+  return h.time.map((time, i) => ({
+    time,
+    hour: clock(time),
+    ...describe(h.weather_code?.[i]),
+    temperature: num(h.temperature_2m?.[i]),
+    precipProbability: rounded(h.precipitation_probability?.[i]),
+  }))
+}
+
+function applyData(payload) {
+  daily.value = payload.daily || {}
+  current.value = payload.current || null
+  hourly.value = payload.hourly || []
+  fetchedAt.value = payload.fetchedAt || Date.now()
 }
 
 async function fetchWeather({ force = false } = {}) {
@@ -126,7 +185,7 @@ async function fetchWeather({ force = false } = {}) {
 
   // Świeży cache dla tej samej lokalizacji - bez zapytania do API (np. przy odświeżeniu strony)
   if (!force && cached?.id === cacheId(loc) && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
-    daily.value = cached.daily
+    applyData(cached)
     status.value = 'ready'
     errorMessage.value = ''
     return
@@ -140,7 +199,32 @@ async function fetchWeather({ force = false } = {}) {
     const params = new URLSearchParams({
       latitude: String(loc.latitude),
       longitude: String(loc.longitude),
-      daily: 'weather_code,temperature_2m_max,temperature_2m_min',
+      current: [
+        'temperature_2m',
+        'apparent_temperature',
+        'relative_humidity_2m',
+        'weather_code',
+        'wind_speed_10m',
+        'wind_direction_10m',
+        'wind_gusts_10m',
+        'pressure_msl',
+        'cloud_cover',
+        'precipitation',
+        'is_day',
+      ].join(','),
+      hourly: 'temperature_2m,weather_code,precipitation_probability',
+      forecast_hours: String(HOURLY_HOURS),
+      daily: [
+        'weather_code',
+        'temperature_2m_max',
+        'temperature_2m_min',
+        'sunrise',
+        'sunset',
+        'precipitation_probability_max',
+        'precipitation_sum',
+        'wind_speed_10m_max',
+        'uv_index_max',
+      ].join(','),
       timezone: 'auto',
       past_days: String(PAST_DAYS),
       forecast_days: String(FORECAST_DAYS),
@@ -148,10 +232,18 @@ async function fetchWeather({ force = false } = {}) {
     const response = await fetch(`${API_URL}?${params}`, { signal: controller.signal })
     if (!response.ok) throw new Error(`Weather API error ${response.status}`)
 
-    daily.value = parseDaily(await response.json())
+    const data = await response.json()
+    const payload = {
+      id: cacheId(loc),
+      fetchedAt: Date.now(),
+      daily: parseDaily(data),
+      current: parseCurrent(data),
+      hourly: parseHourly(data),
+    }
+    applyData(payload)
     status.value = 'ready'
     errorMessage.value = ''
-    writeJson(CACHE_KEY, { id: cacheId(loc), fetchedAt: Date.now(), daily: daily.value })
+    writeJson(CACHE_KEY, payload)
   } catch (err) {
     if (err?.name === 'AbortError') return
     console.error('Weather fetch failed', err)
@@ -174,7 +266,7 @@ function setLocation(next) {
   } else {
     writeJson(LOCATION_KEY, { latitude: next.latitude, longitude: next.longitude, label: next.label })
   }
-  daily.value = {}
+  applyData({})
   status.value = 'loading'
   fetchWeather({ force: true })
 }
@@ -216,9 +308,23 @@ export function useWeather() {
     return weatherFor(date.getFullYear(), date.getMonth(), date.getDate())
   }
 
+  // Kolejne dni od podanej daty (do prognozy tygodniowej)
+  function dailyFrom(date, count) {
+    return Array.from({ length: count }, (_, i) => {
+      const d = new Date(date)
+      d.setDate(d.getDate() + i)
+      return weatherForDate(d)
+    }).filter(Boolean)
+  }
+
   onMounted(() => {
     activeConsumers += 1
     if (activeConsumers === 1) {
+      try {
+        localStorage.removeItem(LEGACY_CACHE_KEY)
+      } catch {
+        // brak dostępu do localStorage
+      }
       fetchWeather()
       refreshTimer = setInterval(() => fetchWeather({ force: true }), REFRESH_INTERVAL_MS)
     }
@@ -238,8 +344,12 @@ export function useWeather() {
     status: computed(() => status.value),
     errorMessage: computed(() => errorMessage.value),
     locating: computed(() => locating.value),
+    current: computed(() => current.value),
+    hourly: computed(() => hourly.value),
+    fetchedAt: computed(() => fetchedAt.value),
     weatherFor,
     weatherForDate,
+    dailyFrom,
     retry: () => fetchWeather({ force: true }),
     locateMe,
     resetLocation,
